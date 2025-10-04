@@ -1,174 +1,225 @@
 import express from "express";
 import cors from "cors";
-import pkg from "pg";
-const { Pool } = pkg;
+import { Pool } from "pg";
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
-// Подключение к Neon (строка будет из переменной окружения)
+// CORS
+const corsOrigin = process.env.CORS_ORIGIN || "*";
+app.use(cors({ origin: corsOrigin }));
+
+// PG pool (Neon)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // Neon требует SSL
+  ssl: { rejectUnauthorized: false } // Neon требует TLS
 });
 
-// корень — просто проверка, что жив
-app.get("/", (req, res) => {
-  res.send("Leaderboard server is running ✅");
-});
+// Простой health
+app.get("/ping", (req, res) => res.send("pong"));
 
-// 1) Проверить доступность имени
-app.post("/username/check", async (req, res) => {
+// --- Вспомогательные функции ---
+
+function sanitizeUsername(name) {
+  if (typeof name !== "string") return null;
+  const trimmed = name.trim();
+  // Разрешаем буквы/цифры/подчёркивания/дефисы, длина 3..20
+  if (!/^[A-Za-z0-9_\-]{3,20}$/.test(trimmed)) return null;
+  return trimmed;
+}
+
+async function getOrCreateUser(deviceId, usernameOpt) {
+  // username может быть null → сгенерим
+  let username = sanitizeUsername(usernameOpt || "");
+  if (!username) {
+    // простая генерация вида Player1234
+    username = "Player" + Math.floor(1000 + Math.random() * 9000);
+  }
+
+  // 1) есть ли пользователь с таким deviceId?
+  const { rows: existing } = await pool.query(
+    `SELECT id, device_id, username FROM users WHERE device_id = $1`,
+    [deviceId]
+  );
+  if (existing.length > 0) {
+    return existing[0];
+  }
+
+  // 2) создаём нового
+  const { rows } = await pool.query(
+    `INSERT INTO users (device_id, username)
+     VALUES ($1, $2)
+     ON CONFLICT (device_id) DO UPDATE SET username = EXCLUDED.username
+     RETURNING id, device_id, username`,
+    [deviceId, username]
+  );
+  return rows[0];
+}
+
+// --- Маршруты ---
+
+// 1) Регистрация/апсерт пользователя
+// POST /v1/user/upsert  { deviceId, username? }
+app.post("/v1/user/upsert", async (req, res) => {
   try {
-    const { username } = req.body || {};
-    if (!username) return res.status(400).json({ ok: false, error: "username required" });
-    const q = await pool.query("select 1 from users where username = $1", [username]);
-    res.json({ ok: true, available: q.rowCount === 0 });
+    const { deviceId, username } = req.body;
+    if (!deviceId || typeof deviceId !== "string") {
+      return res.status(400).json({ error: "deviceId is required" });
+    }
+    const user = await getOrCreateUser(deviceId, username);
+    return res.json({ userId: user.id, username: user.username });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: "server error" });
+    console.error("upsert error", e);
+    return res.status(500).json({ error: "server_error" });
   }
 });
 
-// 2) Регистрация (deviceId + username)
-app.post("/register", async (req, res) => {
+// 2) Смена ника
+// POST /v1/user/username  { deviceId, newUsername }
+app.post("/v1/user/username", async (req, res) => {
   try {
-    const { deviceId, username } = req.body || {};
-    if (!deviceId || !username) {
-      return res.status(400).json({ ok: false, error: "deviceId and username required" });
-    }
-    await pool.query(
-      `insert into users (device_id, username) values ($1, $2)`,
-      [deviceId, username]
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    if (e.code === "23505") {
-      // уникальность нарушена
-      return res.status(409).json({ ok: false, error: "username or deviceId already exists" });
-    }
-    console.error(e);
-    res.status(500).json({ ok: false, error: "server error" });
-  }
-});
+    const { deviceId, newUsername } = req.body;
+    if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+    const uname = sanitizeUsername(newUsername);
+    if (!uname) return res.status(400).json({ error: "bad_username" });
 
-// 3) Смена имени
-app.post("/username/change", async (req, res) => {
-  try {
-    const { deviceId, newUsername } = req.body || {};
-    if (!deviceId || !newUsername) {
-      return res.status(400).json({ ok: false, error: "deviceId and newUsername required" });
-    }
-    const u = await pool.query("select 1 from users where device_id = $1", [deviceId]);
-    if (u.rowCount === 0) return res.status(404).json({ ok: false, error: "user not found" });
-
-    await pool.query(
-      "update users set username = $1, updated_at = now() where device_id = $2",
-      [newUsername, deviceId]
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    if (e.code === "23505") {
-      return res.status(409).json({ ok: false, error: "username already taken" });
-    }
-    console.error(e);
-    res.status(500).json({ ok: false, error: "server error" });
-  }
-});
-
-// 4) Обновление рейтинга и количества ачивок
-//    Нужен заголовок x-api-key, чтобы не накручивали извне
-app.post("/rating/update", async (req, res) => {
-  try {
-    const apiKey = req.header("x-api-key");
-    if (!apiKey || apiKey !== process.env.API_KEY) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-    const { deviceId, ratingClassic, ratingInfinity, achievementsCompleted } = req.body || {};
-    if (!deviceId) return res.status(400).json({ ok: false, error: "deviceId required" });
-
-    await pool.query(
-      `update users
-          set rating_classic = coalesce($2, rating_classic),
-              rating_infinity = coalesce($3, rating_infinity),
-              achievements_completed = coalesce($4, achievements_completed),
-              updated_at = now()
-        where device_id = $1`,
-      [deviceId, ratingClassic ?? null, ratingInfinity ?? null, achievementsCompleted ?? null]
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: "server error" });
-  }
-});
-
-// 5) Топ (по классике или по инфинити)
-// GET /leaderboard?mode=classic&limit=10
-app.get("/leaderboard", async (req, res) => {
-  try {
-    const mode = (req.query.mode === "infinity") ? "infinity" : "classic";
-    const limit = Math.min(parseInt(req.query.limit || "10", 10), 100);
-    const col = mode === "infinity" ? "rating_infinity" : "rating_classic";
-
-    const q = await pool.query(
-      `select username, ${col} as rating, achievements_completed
-         from users
-        where username is not null
-        order by ${col} desc, updated_at desc
-        limit $1`,
-      [limit]
-    );
-    res.json({ ok: true, mode, rows: q.rows });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: "server error" });
-  }
-});
-
-// 6) Место игрока (возвращает rank и его данные)
-// GET /me/:deviceId
-app.get("/me/:deviceId", async (req, res) => {
-  try {
-    const { deviceId } = req.params;
-    const qUser = await pool.query(
-      `select device_id, username, rating_classic, rating_infinity, achievements_completed
-         from users
-        where device_id = $1`,
+    const { rows: urows } = await pool.query(
+      `SELECT id FROM users WHERE device_id = $1`,
       [deviceId]
     );
-    if (qUser.rowCount === 0) return res.status(404).json({ ok: false, error: "user not found" });
+    if (urows.length === 0) return res.status(404).json({ error: "user_not_found" });
+    const userId = urows[0].id;
 
-    const user = qUser.rows[0];
-
-    const qRankClassic = await pool.query(
-      `select 1 from users where rating_classic > $1`,
-      [user.rating_classic]
+    await pool.query(
+      `UPDATE users SET username = $1 WHERE id = $2`,
+      [uname, userId]
     );
-    const qRankInfinity = await pool.query(
-      `select 1 from users where rating_infinity > $1`,
-      [user.rating_infinity]
-    );
-
-    res.json({
-      ok: true,
-      user: {
-        username: user.username,
-        ratingClassic: user.rating_classic,
-        ratingInfinity: user.rating_infinity,
-        achievementsCompleted: user.achievements_completed
-      },
-      rank: {
-        classic: qRankClassic.rowCount + 1,
-        infinity: qRankInfinity.rowCount + 1
-      }
-    });
+    return res.json({ ok: true, username: uname });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ ok: false, error: "server error" });
+    if (String(e).includes("duplicate key value")) {
+      return res.status(409).json({ error: "username_taken" });
+    }
+    console.error("username error", e);
+    return res.status(500).json({ error: "server_error" });
   }
 });
 
+// 3) Сабмит рейтинга/ачивок
+// POST /v1/score/submit  { deviceId, mode: "classic"|"infinity", rating, achievementsTotal }
+app.post("/v1/score/submit", async (req, res) => {
+  try {
+    const { deviceId, mode, rating, achievementsTotal } = req.body;
+    if (!deviceId || !mode || typeof rating !== "number") {
+      return res.status(400).json({ error: "deviceId, mode, rating required" });
+    }
+    if (!["classic", "infinity"].includes(mode)) {
+      return res.status(400).json({ error: "bad_mode" });
+    }
+
+    const user = await getOrCreateUser(deviceId, null);
+    const ach = Number.isFinite(achievementsTotal) ? Math.max(0, achievementsTotal) : 0;
+
+    await pool.query(
+      `INSERT INTO ratings (user_id, mode, rating, achievements_total)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, mode)
+       DO UPDATE SET rating = EXCLUDED.rating, achievements_total = EXCLUDED.achievements_total, updated_at = now()`,
+      [user.id, mode, rating, ach]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("submit error", e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// 4) Топ-лист
+// GET /v1/leaderboard/top?mode=classic&limit=10
+app.get("/v1/leaderboard/top", async (req, res) => {
+  try {
+    const mode = (req.query.mode || "classic").toString();
+    const limit = Math.min(parseInt(req.query.limit || "10", 10), 100);
+    if (!["classic", "infinity"].includes(mode)) {
+      return res.status(400).json({ error: "bad_mode" });
+    }
+
+    const { rows } = await pool.query(
+      `
+      WITH ranks AS (
+        SELECT
+          u.username,
+          r.rating,
+          r.achievements_total,
+          ROW_NUMBER() OVER (ORDER BY r.rating DESC, u.created_at ASC, u.id ASC) AS rank
+        FROM ratings r
+        JOIN users u ON u.id = r.user_id
+        WHERE r.mode = $1
+      )
+      SELECT * FROM ranks ORDER BY rank ASC LIMIT $2
+      `,
+      [mode, limit]
+    );
+    return res.json({ mode, rows });
+  } catch (e) {
+    console.error("top error", e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// 5) «Рядом с тобой»
+// GET /v1/leaderboard/around?mode=classic&deviceId=XXX&radius=3
+app.get("/v1/leaderboard/around", async (req, res) => {
+  try {
+    const mode = (req.query.mode || "classic").toString();
+    const deviceId = (req.query.deviceId || "").toString();
+    const radius = Math.min(parseInt(req.query.radius || "3", 10), 25);
+
+    if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+    if (!["classic", "infinity"].includes(mode)) {
+      return res.status(400).json({ error: "bad_mode" });
+    }
+
+    const { rows: urows } = await pool.query(
+      `SELECT id FROM users WHERE device_id = $1`,
+      [deviceId]
+    );
+    if (urows.length === 0) return res.status(404).json({ error: "user_not_found" });
+    const userId = urows[0].id;
+
+    const { rows } = await pool.query(
+      `
+      WITH ranks AS (
+        SELECT
+          u.id as user_id,
+          u.username,
+          r.rating,
+          r.achievements_total,
+          ROW_NUMBER() OVER (ORDER BY r.rating DESC, u.created_at ASC, u.id ASC) AS rank
+        FROM ratings r
+        JOIN users u ON u.id = r.user_id
+        WHERE r.mode = $1
+      ),
+      me AS (
+        SELECT rank FROM ranks WHERE user_id = $2
+      )
+      SELECT * FROM ranks
+      WHERE rank BETWEEN (SELECT rank FROM me) - $3 AND (SELECT rank FROM me) + $3
+      ORDER BY rank ASC
+      `,
+      [mode, userId, radius]
+    );
+
+    return res.json({ mode, rows });
+  } catch (e) {
+    console.error("around error", e);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+// PORT отдает Render
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server listening on port", PORT));
+app.listen(PORT, () => {
+  console.log("Leaderboard API listening on port", PORT);
+});
+
