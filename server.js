@@ -29,31 +29,40 @@ function sanitizeUsername(name) {
 }
 
 async function getOrCreateUser(deviceId, usernameOpt) {
-  // username может быть null → сгенерим
-  let username = sanitizeUsername(usernameOpt || "");
-  if (!username) {
-    // простая генерация вида Player1234
-    username = "Player" + Math.floor(1000 + Math.random() * 9000);
+  // 1) если пользователь уже есть по deviceId — вернём его
+  {
+    const { rows } = await pool.query(
+      `SELECT id, device_id, username FROM users WHERE device_id = $1`,
+      [deviceId]
+    );
+    if (rows.length > 0) return rows[0];
   }
 
-  // 1) есть ли пользователь с таким deviceId?
-  const { rows: existing } = await pool.query(
-    `SELECT id, device_id, username FROM users WHERE device_id = $1`,
-    [deviceId]
-  );
-  if (existing.length > 0) {
-    return existing[0];
+  // 2) подготовим ник: из запроса или сгенерируем
+  const base = sanitizeUsername(usernameOpt || "") || ("Player" + Math.floor(1000 + Math.random() * 9000));
+
+  // 3) пробуем до 5 вариантов (добавляя суффикс), чтобы избежать уникального конфликта
+  for (let i = 0; i < 5; i++) {
+    const candidate = i === 0 ? base : `${base}${Math.floor(Math.random() * 1000)}`;
+
+    try {
+      const { rows } = await pool.query(
+        `INSERT INTO users (device_id, username)
+         VALUES ($1, $2)
+         ON CONFLICT (device_id) DO UPDATE SET username = EXCLUDED.username
+         RETURNING id, device_id, username`,
+        [deviceId, candidate]
+      );
+      return rows[0];
+    } catch (e) {
+      // 23505 — уникальный конфликт по username: пробуем ещё
+      if (e && e.code === '23505') continue;
+      throw e;
+    }
   }
 
-  // 2) создаём нового
-  const { rows } = await pool.query(
-    `INSERT INTO users (device_id, username)
-     VALUES ($1, $2)
-     ON CONFLICT (device_id) DO UPDATE SET username = EXCLUDED.username
-     RETURNING id, device_id, username`,
-    [deviceId, username]
-  );
-  return rows[0];
+  // если 5 попыток не хватило
+  throw new Error("could_not_assign_username");
 }
 
 // --- Маршруты ---
