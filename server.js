@@ -1,234 +1,185 @@
-import express from "express";
-import cors from "cors";
-import { Pool } from "pg";
+/**
+ * Verto Leaderboard server
+ * ------------------------
+ * Что нужно настроить на Render (Settings → Environment):
+ *   - DATABASE_URL = ВАША_СТРОКА_ИЗ_NEON (postgresql://...sslmode=require&channel_binding=require)
+ *   - APP_SECRET   = ТОТ_ЖЕ_СЕКРЕТ, ЧТО В Android (gradle.properties → LEADERBOARD_APP_SECRET)
+ */
+
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
-// CORS
-const corsOrigin = process.env.CORS_ORIGIN || "*";
-app.use(cors({ origin: corsOrigin }));
+// === СЕКРЕТ: сервер принимает запись только с правильным X-App-Secret ===
+const APP_SECRET =
+  process.env.APP_SECRET ||
+  process.env.LEADERBOARD_APP_SECRET || // на всякий случай поддержим оба имени
+  '';
 
-// PG pool (Neon)
+function requireSecret(req, res, next) {
+  if (!APP_SECRET) return res.status(500).json({ error: 'server_misconfigured' });
+  const got = req.get('X-App-Secret') || '';
+  if (got !== APP_SECRET) return res.status(403).json({ error: 'forbidden' });
+  next();
+}
+
+// === БД: строка подключения из Neon в переменной окружения DATABASE_URL ===
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false } // Neon требует TLS
+  connectionString: process.env.DATABASE_URL, // вставлять вручную НЕ нужно — задаётся в Render
+  ssl: { rejectUnauthorized: false } // это нужно для Neon
 });
 
-// Простой health
-app.get("/ping", (req, res) => res.send("pong"));
-
-// --- Вспомогательные функции ---
-
-function sanitizeUsername(name) {
-  if (typeof name !== "string") return null;
-  const trimmed = name.trim();
-  // Разрешаем буквы/цифры/подчёркивания/дефисы, длина 3..20
-  if (!/^[A-Za-z0-9_\-]{3,20}$/.test(trimmed)) return null;
-  return trimmed;
+// создаём таблицу, если её ещё нет
+async function ensureTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS players (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL DEFAULT 'Player',
+      rating_classic INT NOT NULL DEFAULT 1000,
+      rating_infinity INT NOT NULL DEFAULT 1000,
+      achievements_count INT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_players_rc ON players (rating_classic DESC, updated_at ASC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_players_ri ON players (rating_infinity DESC, updated_at ASC);`);
 }
 
-async function getOrCreateUser(deviceId, usernameOpt) {
-  // 1) если пользователь уже есть по deviceId — вернём его
-  {
-    const { rows } = await pool.query(
-      `SELECT id, device_id, username FROM users WHERE device_id = $1`,
-      [deviceId]
-    );
-    if (rows.length > 0) return rows[0];
-  }
+// healthcheck
+app.get('/ping', (_, res) => res.send('pong'));
 
-  // 2) подготовим ник: из запроса или сгенерируем
-  const base = sanitizeUsername(usernameOpt || "") || ("Player" + Math.floor(1000 + Math.random() * 9000));
-
-  // 3) пробуем до 5 вариантов (добавляя суффикс), чтобы избежать уникального конфликта
-  for (let i = 0; i < 5; i++) {
-    const candidate = i === 0 ? base : `${base}${Math.floor(Math.random() * 1000)}`;
-
-    try {
-      const { rows } = await pool.query(
-        `INSERT INTO users (device_id, username)
-         VALUES ($1, $2)
-         ON CONFLICT (device_id) DO UPDATE SET username = EXCLUDED.username
-         RETURNING id, device_id, username`,
-        [deviceId, candidate]
-      );
-      return rows[0];
-    } catch (e) {
-      // 23505 — уникальный конфликт по username: пробуем ещё
-      if (e && e.code === '23505') continue;
-      throw e;
-    }
-  }
-
-  // если 5 попыток не хватило
-  throw new Error("could_not_assign_username");
-}
-
-// --- Маршруты ---
-
-// 1) Регистрация/апсерт пользователя
-// POST /v1/user/upsert  { deviceId, username? }
-app.post("/v1/user/upsert", async (req, res) => {
+// === POST /api/upsert (write, требует X-App-Secret) ===
+// Тело запроса (JSON):
+// { deviceId, username, ratingClassic, ratingInfinity, achievementsCount }
+app.post('/api/upsert', requireSecret, async (req, res) => {
   try {
-    const { deviceId, username } = req.body;
-    if (!deviceId || typeof deviceId !== "string") {
-      return res.status(400).json({ error: "deviceId is required" });
-    }
-    const user = await getOrCreateUser(deviceId, username);
-    return res.json({ userId: user.id, username: user.username });
+    const { deviceId, username, ratingClassic, ratingInfinity, achievementsCount } = req.body || {};
+    if (!deviceId) return res.status(400).json({ error: 'deviceId_required' });
+
+    const q = `
+      INSERT INTO players (id, username, rating_classic, rating_infinity, achievements_count, updated_at)
+      VALUES ($1, COALESCE($2, 'Player'), COALESCE($3, 1000), COALESCE($4, 1000), COALESCE($5, 0), now())
+      ON CONFLICT (id) DO UPDATE SET
+        username = COALESCE(EXCLUDED.username, players.username),
+        rating_classic = COALESCE(EXCLUDED.rating_classic, players.rating_classic),
+        rating_infinity = COALESCE(EXCLUDED.rating_infinity, players.rating_infinity),
+        achievements_count = COALESCE(EXCLUDED.achievements_count, players.achievements_count),
+        updated_at = now()
+      RETURNING
+        id,
+        username,
+        rating_classic   AS "ratingClassic",
+        rating_infinity  AS "ratingInfinity",
+        achievements_count AS "achievementsCount",
+        updated_at       AS "updatedAt";
+    `;
+    const { rows } = await pool.query(q, [
+      deviceId,
+      username ?? null,
+      ratingClassic ?? null,
+      ratingInfinity ?? null,
+      achievementsCount ?? null
+    ]);
+    res.json(rows[0]);
   } catch (e) {
-    console.error("upsert error", e);
-    return res.status(500).json({ error: "server_error" });
+    console.error('upsert error', e);
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
-// 2) Смена ника
-// POST /v1/user/username  { deviceId, newUsername }
-app.post("/v1/user/username", async (req, res) => {
+// === GET /api/top?mode=classic|infinity&limit=10 ===
+// Ответ: { items: ApiPlayer[] }
+app.get('/api/top', async (req, res) => {
   try {
-    const { deviceId, newUsername } = req.body;
-    if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-    const uname = sanitizeUsername(newUsername);
-    if (!uname) return res.status(400).json({ error: "bad_username" });
+    const mode = req.query.mode === 'infinity' ? 'infinity' : 'classic';
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit || '10', 10), 50));
 
-    const { rows: urows } = await pool.query(
-      `SELECT id FROM users WHERE device_id = $1`,
-      [deviceId]
-    );
-    if (urows.length === 0) return res.status(404).json({ error: "user_not_found" });
-    const userId = urows[0].id;
+    const sqlClassic = `
+      SELECT id, username,
+             rating_classic  AS "ratingClassic",
+             rating_infinity AS "ratingInfinity",
+             achievements_count AS "achievementsCount",
+             updated_at      AS "updatedAt"
+      FROM players
+      ORDER BY rating_classic DESC, updated_at ASC
+      LIMIT $1;
+    `;
+    const sqlInfinity = `
+      SELECT id, username,
+             rating_classic  AS "ratingClassic",
+             rating_infinity AS "ratingInfinity",
+             achievements_count AS "achievementsCount",
+             updated_at      AS "updatedAt"
+      FROM players
+      ORDER BY rating_infinity DESC, updated_at ASC
+      LIMIT $1;
+    `;
 
-    await pool.query(
-      `UPDATE users SET username = $1 WHERE id = $2`,
-      [uname, userId]
-    );
-    return res.json({ ok: true, username: uname });
+    const { rows } = await pool.query(mode === 'classic' ? sqlClassic : sqlInfinity, [limit]);
+    res.json({ items: rows });
   } catch (e) {
-    if (String(e).includes("duplicate key value")) {
-      return res.status(409).json({ error: "username_taken" });
-    }
-    console.error("username error", e);
-    return res.status(500).json({ error: "server_error" });
+    console.error('top error', e);
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
-// 3) Сабмит рейтинга/ачивок
-// POST /v1/score/submit  { deviceId, mode: "classic"|"infinity", rating, achievementsTotal }
-app.post("/v1/score/submit", async (req, res) => {
+// === GET /api/me?device_id=...&mode=classic|infinity ===
+// Ответ: { me: ApiPlayer|null, rank: number|null }
+app.get('/api/me', async (req, res) => {
   try {
-    const { deviceId, mode, rating, achievementsTotal } = req.body;
-    if (!deviceId || !mode || typeof rating !== "number") {
-      return res.status(400).json({ error: "deviceId, mode, rating required" });
-    }
-    if (!["classic", "infinity"].includes(mode)) {
-      return res.status(400).json({ error: "bad_mode" });
-    }
+    const id = req.query.device_id;
+    if (!id) return res.status(400).json({ error: 'device_id_required' });
+    const mode = req.query.mode === 'infinity' ? 'infinity' : 'classic';
 
-    const user = await getOrCreateUser(deviceId, null);
-    const ach = Number.isFinite(achievementsTotal) ? Math.max(0, achievementsTotal) : 0;
+    const sqlRankClassic = `
+      SELECT id, username,
+             rating_classic  AS "ratingClassic",
+             rating_infinity AS "ratingInfinity",
+             achievements_count AS "achievementsCount",
+             updated_at      AS "updatedAt",
+             RANK() OVER (ORDER BY rating_classic DESC, updated_at ASC) AS r
+      FROM players;
+    `;
+    const sqlRankInfinity = `
+      SELECT id, username,
+             rating_classic  AS "ratingClassic",
+             rating_infinity AS "ratingInfinity",
+             achievements_count AS "achievementsCount",
+             updated_at      AS "updatedAt",
+             RANK() OVER (ORDER BY rating_infinity DESC, updated_at ASC) AS r
+      FROM players;
+    `;
 
-    await pool.query(
-      `INSERT INTO ratings (user_id, mode, rating, achievements_total)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (user_id, mode)
-       DO UPDATE SET rating = EXCLUDED.rating, achievements_total = EXCLUDED.achievements_total, updated_at = now()`,
-      [user.id, mode, rating, ach]
-    );
-
-    return res.json({ ok: true });
+    const { rows } = await pool.query(mode === 'classic' ? sqlRankClassic : sqlRankInfinity);
+    const meRow = rows.find((r) => r.id === id) || null;
+    res.json({
+      me: meRow ? {
+        id: meRow.id,
+        username: meRow.username,
+        ratingClassic: meRow.ratingClassic,
+        ratingInfinity: meRow.ratingInfinity,
+        achievementsCount: meRow.achievementsCount,
+        updatedAt: meRow.updatedAt
+      } : null,
+      rank: meRow ? Number(meRow.r) : null
+    });
   } catch (e) {
-    console.error("submit error", e);
-    return res.status(500).json({ error: "server_error" });
+    console.error('me error', e);
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
-// 4) Топ-лист
-// GET /v1/leaderboard/top?mode=classic&limit=10
-app.get("/v1/leaderboard/top", async (req, res) => {
-  try {
-    const mode = (req.query.mode || "classic").toString();
-    const limit = Math.min(parseInt(req.query.limit || "10", 10), 100);
-    if (!["classic", "infinity"].includes(mode)) {
-      return res.status(400).json({ error: "bad_mode" });
-    }
-
-    const { rows } = await pool.query(
-      `
-      WITH ranks AS (
-        SELECT
-          u.username,
-          r.rating,
-          r.achievements_total,
-          ROW_NUMBER() OVER (ORDER BY r.rating DESC, u.created_at ASC, u.id ASC) AS rank
-        FROM ratings r
-        JOIN users u ON u.id = r.user_id
-        WHERE r.mode = $1
-      )
-      SELECT * FROM ranks ORDER BY rank ASC LIMIT $2
-      `,
-      [mode, limit]
-    );
-    return res.json({ mode, rows });
-  } catch (e) {
-    console.error("top error", e);
-    return res.status(500).json({ error: "server_error" });
-  }
-});
-
-// 5) «Рядом с тобой»
-// GET /v1/leaderboard/around?mode=classic&deviceId=XXX&radius=3
-app.get("/v1/leaderboard/around", async (req, res) => {
-  try {
-    const mode = (req.query.mode || "classic").toString();
-    const deviceId = (req.query.deviceId || "").toString();
-    const radius = Math.min(parseInt(req.query.radius || "3", 10), 25);
-
-    if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-    if (!["classic", "infinity"].includes(mode)) {
-      return res.status(400).json({ error: "bad_mode" });
-    }
-
-    const { rows: urows } = await pool.query(
-      `SELECT id FROM users WHERE device_id = $1`,
-      [deviceId]
-    );
-    if (urows.length === 0) return res.status(404).json({ error: "user_not_found" });
-    const userId = urows[0].id;
-
-    const { rows } = await pool.query(
-      `
-      WITH ranks AS (
-        SELECT
-          u.id as user_id,
-          u.username,
-          r.rating,
-          r.achievements_total,
-          ROW_NUMBER() OVER (ORDER BY r.rating DESC, u.created_at ASC, u.id ASC) AS rank
-        FROM ratings r
-        JOIN users u ON u.id = r.user_id
-        WHERE r.mode = $1
-      ),
-      me AS (
-        SELECT rank FROM ranks WHERE user_id = $2
-      )
-      SELECT * FROM ranks
-      WHERE rank BETWEEN (SELECT rank FROM me) - $3 AND (SELECT rank FROM me) + $3
-      ORDER BY rank ASC
-      `,
-      [mode, userId, radius]
-    );
-
-    return res.json({ mode, rows });
-  } catch (e) {
-    console.error("around error", e);
-    return res.status(500).json({ error: "server_error" });
-  }
-});
-
-// PORT отдает Render
+// стартуем сервер
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Leaderboard API listening on port", PORT);
+app.listen(PORT, async () => {
+  try {
+    await ensureTables();
+    console.log('Leaderboard server listening on ' + PORT);
+  } catch (e) {
+    console.error('ensureTables error', e);
+  }
 });
-
